@@ -69,9 +69,10 @@ python .\train_antigen_dplm.py `
   --hi .\HI.csv `
   --structure-dir .\structures `
   --encoder dplm2 `
-  --dplm-module your_dplm_package.module `
-  --dplm-class YourDPLM2Class `
-  --dplm-model path_or_model_name `
+  --dplm-module byprot.models.dplm2 `
+  --dplm-class MultimodalDiffusionProteinLanguageModel `
+  --dplm-model /home/zhouchunyan/postgraduate/influenza-virus_LLM/research2_dplm/my_dplm/airkingbd/dplm2_150m `
+  --dplm-struct-tokenizer-dir /home/zhouchunyan/postgraduate/influenza-virus_LLM/research2_dplm/my_dplm/airkingbd/struct_tokenizer `
   --use-lora `
   --lora-targets q_proj,k_proj,v_proj,o_proj `
   --output-dir .\outputs_dplm2

@@ -28,6 +28,21 @@ AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWYXBZJUO"
 AA_TO_ID = {aa: i + 1 for i, aa in enumerate(AMINO_ACIDS)}
 PAD_ID = 0
 
+DEFAULT_HA_PATH = Path("dataset/NHT/H5_NHT_HA.csv")
+DEFAULT_HI_PATH = Path("dataset/NHT/H5_NHT_HI.csv")
+DEFAULT_STRUCTURE_DIR = Path(
+    "/home/zhouchunyan/postgraduate/influenza-virus_LLM/"
+    "research2_geometric_graph_learning/myResearch/data/features/Structures/H5N1"
+)
+DEFAULT_DPLM_MODEL = Path(
+    "/home/zhouchunyan/postgraduate/influenza-virus_LLM/"
+    "research2_dplm/my_dplm/airkingbd/dplm2_150m"
+)
+DEFAULT_DPLM_STRUCT_TOKENIZER_DIR = Path(
+    "/home/zhouchunyan/postgraduate/influenza-virus_LLM/"
+    "research2_dplm/my_dplm/airkingbd/struct_tokenizer"
+)
+
 
 @dataclass
 class VirusRecord:
@@ -493,12 +508,23 @@ class DPLM2Backbone(nn.Module):
     If your dplm-2 API differs, edit only this class.
     """
 
-    def __init__(self, module_name: str, class_name: str, model_name_or_path: str):
+    def __init__(
+        self,
+        module_name: str,
+        class_name: str,
+        model_name_or_path: str,
+        struct_tokenizer_dir: Optional[str] = None,
+    ):
         super().__init__()
         module = importlib.import_module(module_name)
         cls = getattr(module, class_name)
+        model_name_or_path = str(model_name_or_path)
+        struct_tokenizer_dir = str(struct_tokenizer_dir) if struct_tokenizer_dir else None
         if hasattr(cls, "from_pretrained"):
-            self.model = cls.from_pretrained(model_name_or_path)
+            cfg_override = {"tokenizer": {"vocab_file": model_name_or_path}}
+            if struct_tokenizer_dir:
+                cfg_override["struct_tokenizer"] = {"exp_path": struct_tokenizer_dir}
+            self.model = cls.from_pretrained(model_name_or_path, cfg_override=cfg_override)
         else:
             self.model = cls(model_name_or_path)
 
@@ -546,7 +572,7 @@ def build_backbone(args: argparse.Namespace) -> nn.Module:
 
     if not args.dplm_module or not args.dplm_class or not args.dplm_model:
         raise ValueError("--dplm-module, --dplm-class and --dplm-model are required for --encoder dplm2")
-    return DPLM2Backbone(args.dplm_module, args.dplm_class, args.dplm_model)
+    return DPLM2Backbone(args.dplm_module, args.dplm_class, args.dplm_model, args.dplm_struct_tokenizer_dir)
 
 
 def similarity(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -778,32 +804,36 @@ def save_triplets(triplets: List[TripletRecord], path: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DPLM-2 HI-distance DPO and antigen-map training pipeline.")
-    parser.add_argument("--ha", type=Path, required=True, help="HA csv: index,name,location,id,year,seq")
-    parser.add_argument("--hi", type=Path, required=True, help="HI csv: at_index,sr_index,max_year,min_year,distance,class")
-    parser.add_argument("--structure-dir", type=Path, default=None)
+    parser.add_argument("--ha", type=Path, default=DEFAULT_HA_PATH, help="HA csv: index,name,location,id,year,seq")
+    parser.add_argument("--hi", type=Path, default=DEFAULT_HI_PATH, help="HI csv: at_index,sr_index,max_year,min_year,distance,class")
+    parser.add_argument("--structure-dir", type=Path, default=DEFAULT_STRUCTURE_DIR)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
     parser.add_argument("--require-structure", action="store_true")
     parser.add_argument("--no-recursive-structure-search", action="store_true")
     parser.add_argument("--no-dedupe-structure-by-seq", action="store_true")
 
-    parser.add_argument("--encoder", choices=["simple", "dplm2"], default="simple")
-    parser.add_argument("--dplm-module", default=None)
-    parser.add_argument("--dplm-class", default=None)
-    parser.add_argument("--dplm-model", default=None)
+    parser.add_argument("--encoder", choices=["simple", "dplm2"], default="dplm2")
+    parser.add_argument("--dplm-module", default="byprot.models.dplm2")
+    parser.add_argument("--dplm-class", default="MultimodalDiffusionProteinLanguageModel")
+    parser.add_argument("--dplm-model", type=Path, default=DEFAULT_DPLM_MODEL)
+    parser.add_argument("--dplm-struct-tokenizer-dir", type=Path, default=DEFAULT_DPLM_STRUCT_TOKENIZER_DIR)
     parser.add_argument("--max-seq-len", type=int, default=768)
     parser.add_argument("--structure-dim", type=int, default=512)
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--embedding-dim", type=int, default=256)
 
-    parser.add_argument("--use-lora", action="store_true")
-    parser.add_argument("--lora-r", type=int, default=8)
-    parser.add_argument("--lora-alpha", type=int, default=16)
+    lora_group = parser.add_mutually_exclusive_group()
+    lora_group.add_argument("--use-lora", dest="use_lora", action="store_true")
+    lora_group.add_argument("--no-use-lora", dest="use_lora", action="store_false")
+    parser.set_defaults(use_lora=True)
+    parser.add_argument("--lora-r", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--lora-targets", default="q_proj,k_proj,v_proj,o_proj")
 
     parser.add_argument("--distance-threshold", type=float, default=1.0)
     parser.add_argument("--distance-scale", type=float, default=1.0)
-    parser.add_argument("--hi-triplet-mode", choices=["sample", "all"], default="sample")
+    parser.add_argument("--hi-triplet-mode", choices=["sample", "all"], default="all")
     parser.add_argument("--hi-triplets-per-anchor", type=int, default=4)
     parser.add_argument("--seq-threshold", type=float, default=0.05)
     parser.add_argument("--seq-scale", type=float, default=1.0)
