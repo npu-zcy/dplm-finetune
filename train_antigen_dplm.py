@@ -5,6 +5,10 @@ import json
 import math
 import os
 import random
+import subprocess
+import sys
+from tqdm import tqdm
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -26,6 +30,7 @@ except ImportError:
 
 AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWYXBZJUO"
 AA_TO_ID = {aa: i + 1 for i, aa in enumerate(AMINO_ACIDS)}
+ID_TO_AA = {idx: aa for aa, idx in AA_TO_ID.items()}
 PAD_ID = 0
 
 DEFAULT_HA_PATH = Path("dataset/NHT/H5_NHT_HA.csv")
@@ -43,7 +48,12 @@ DEFAULT_DPLM_STRUCT_TOKENIZER_DIR = Path(
     "research2_dplm/my_dplm/airkingbd/struct_tokenizer"
 )
 
+# 结构token
+DEFAULT_STRUCT_SEQ_FASTA = Path("data/tokenized_protein/struct_seq.fasta")
+DEFAULT_TOKENIZED_PROTEIN_DIR = Path("data/tokenized_protein")
 
+
+# 表示单个病毒的所有信息
 @dataclass
 class VirusRecord:
     index: int
@@ -53,8 +63,9 @@ class VirusRecord:
     year: int
     seq: str
     structure_path: Optional[Path]
+    struct_seq: Optional[str] = None
 
-
+# 用于训练 DPO 或 triplet loss 的三元组
 @dataclass
 class TripletRecord:
     anchor: int
@@ -65,18 +76,150 @@ class TripletRecord:
     distance_gap: float
     margin: float
 
-
+# 
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+# 确保 DPLM-2 模型可以拿到每条病毒蛋白的结构 token 序列文件 struct_seq.fasta，如果没有就用 PDB 文件自动生成它，并返回这个路径。
+def ensure_struct_seq_fasta(args: argparse.Namespace) -> Optional[Path]:
+    # 如果用的是不需要结构/已经有对结构tokenizer后文件，则直接返回
+    if args.encoder != "dplm2":
+        return args.struct_seq_fasta
+    if args.struct_seq_fasta is not None and args.struct_seq_fasta.exists():
+        return args.struct_seq_fasta
+
+    # 找 PDB tokenizer 脚本
+    script_path = resolve_pdb_tokenizer_script(args.pdb_tokenizer_script)
+    if script_path is None:
+        raise FileNotFoundError(
+            "struct_seq_fasta does not exist and no PDB tokenizer script was found. "
+            "Please pass --pdb-tokenizer-script /path/to/dplm/src/byprot/utils/protein/tokenize_pdb.py "
+            "or pre-generate --struct-seq-fasta."
+        )
+
+    # 是否存在结构文件
+    if args.structure_dir is None or not args.structure_dir.exists():
+        raise FileNotFoundError(f"Cannot tokenize PDB files because --structure-dir does not exist: {args.structure_dir}")
+
+    output_dir = args.struct_seq_fasta.parent if args.struct_seq_fasta is not None else DEFAULT_TOKENIZED_PROTEIN_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[tokenize] struct_seq_fasta not found, generating with {script_path}")
+    print(f"[tokenize] input_pdb_folder={args.structure_dir}")
+    print(f"[tokenize] output_dir={output_dir}")
+
+    # 如果你指定了本地 struct_tokenizer_dir，它会修改脚本，把 tokenizer 指向本地目录。
+    tokenizer_script = make_local_tokenizer_script(script_path, args.dplm_struct_tokenizer_dir)
+
+    # 设置离线环境并执行, 准备环境变量，确保 离线执行（不下载 HF 模型）。
+    env = os.environ.copy()
+    env.setdefault("HF_HUB_OFFLINE", "1")
+    env.setdefault("TRANSFORMERS_OFFLINE", "1")
+    cmd = [
+        sys.executable,
+        str(tokenizer_script),
+        "--input_pdb_folder",
+        str(args.structure_dir),
+        "--output_dir",
+        str(output_dir),
+    ]
+    try:
+        subprocess.run(cmd, check=True, env=env)
+    finally:
+        if tokenizer_script != script_path and tokenizer_script.exists():
+            tokenizer_script.unlink()
+
+
+    generated = output_dir / "struct_seq.fasta"
+    if not generated.exists():
+        candidates = [output_dir / "struct.fasta"] + sorted(output_dir.glob("*struct*.fasta")) + sorted(output_dir.glob("*struct*.fa"))
+        existing_candidates = [candidate for candidate in candidates if candidate.exists()]
+        if existing_candidates:
+            generated = existing_candidates[0]
+        else:
+            raise FileNotFoundError(
+                f"PDB tokenizer finished but no struct_seq.fasta was found in {output_dir}."
+            )
+    args.struct_seq_fasta = generated
+    print(f"[tokenize] using generated struct_seq_fasta={generated}")
+    return generated
+
+# 让 tokenize_pdb.py 使用你本地的结构 tokenizer：
+def make_local_tokenizer_script(script_path: Path, struct_tokenizer_dir: Optional[Path]) -> Path:
+    if struct_tokenizer_dir is None:
+        return script_path
+    if not struct_tokenizer_dir.exists():
+        raise FileNotFoundError(
+            f"--dplm-struct-tokenizer-dir does not exist: {struct_tokenizer_dir}"
+        )
+
+    text = script_path.read_text(encoding="utf-8")
+    local_path = repr(str(struct_tokenizer_dir))
+    replacements = [
+        ("get_struct_tokenizer()", f"get_struct_tokenizer({local_path})"),
+        ('get_struct_tokenizer("airkingbd/struct_tokenizer")', f"get_struct_tokenizer({local_path})"),
+        ("get_struct_tokenizer('airkingbd/struct_tokenizer')", f"get_struct_tokenizer({local_path})"),
+    ]
+    patched = text
+    changed = False
+    for old, new in replacements:
+        if old in patched:
+            patched = patched.replace(old, new)
+            changed = True
+
+    if not changed:
+        print(
+            "[tokenize] warning: could not patch get_struct_tokenizer call; "
+            "running original tokenizer script."
+        )
+        return script_path
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix="_tokenize_pdb_local.py",
+        delete=False,
+        encoding="utf-8",
+    )
+    with tmp:
+        tmp.write(patched)
+    patched_path = Path(tmp.name)
+    print(f"[tokenize] using local struct tokenizer: {struct_tokenizer_dir}")
+    return patched_path
+
+
+def resolve_pdb_tokenizer_script(script_arg: Optional[Path]) -> Optional[Path]:
+    candidates: List[Path] = []
+    if script_arg is not None:
+        candidates.append(script_arg)
+    candidates.extend(
+        [
+            Path("src/byprot/utils/protein/tokenize_pdb.py"),
+            Path("../src/byprot/utils/protein/tokenize_pdb.py"),
+            Path("../../src/byprot/utils/protein/tokenize_pdb.py"),
+        ]
+    )
+
+    try:
+        byprot_module = importlib.import_module("byprot")
+        byprot_root = Path(byprot_module.__file__).resolve().parent
+        candidates.append(byprot_root / "utils/protein/tokenize_pdb.py")
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        if candidate is not None and candidate.exists():
+            return candidate.resolve()
+    return None
+
 
 def load_ha(
     ha_path: Path,
     structure_dir: Optional[Path],
-    structure_exts: Tuple[str, ...] = (".pt", ".npy", ".npz", ".pdb", ".cif"),
+    struct_seq_fasta: Optional[Path],
+    # 文件扩展名
+    structure_exts: Tuple[str, ...] = (".pt", ".npy", ".npz", ".pdb", ".cif", ".fa", ".fasta", ".txt"),
     recursive_structure_search: bool = True,
 ) -> Dict[int, VirusRecord]:
     ha = pd.read_csv(ha_path)
@@ -86,23 +229,148 @@ def load_ha(
         raise ValueError(f"HA file is missing columns: {sorted(missing)}")
 
     structure_index = build_structure_file_index(structure_dir, structure_exts, recursive_structure_search)
+    struct_seq_index = load_struct_seq_index(struct_seq_fasta)
     records: Dict[int, VirusRecord] = {}
     for row in ha.itertuples(index=False):
         virus_index = int(getattr(row, "index"))
         virus_id = str(getattr(row, "id"))
-        structure_path = find_structure_file(structure_index, virus_id, str(getattr(row, "name")))
+        name = str(getattr(row, "name"))
+        structure_path = find_structure_file(structure_index, name.replace('/', ''))
+        struct_seq = find_struct_seq(struct_seq_index, name.replace('/', ''))
+        if struct_seq is None or structure_path is None:
+            print(name)
+            exit()
         records[virus_index] = VirusRecord(
             index=virus_index,
-            name=str(getattr(row, "name")),
+            name=name,
             location=str(getattr(row, "location")),
             virus_id=virus_id,
             year=int(getattr(row, "year")),
             seq=str(getattr(row, "seq")).strip().upper(),
             structure_path=structure_path,
+            struct_seq=struct_seq,
         )
+    matched_struct_seq = sum(1 for record in records.values() if record.struct_seq)
+    matched_structure_file = sum(1 for record in records.values() if record.structure_path is not None)
+    print(
+        f"[data] HA rows={len(records)} "
+        f"matched_structure_files={matched_structure_file} "
+        f"matched_struct_seq={matched_struct_seq} "
+        f"struct_seq_fasta={struct_seq_fasta}"
+    )
+    return records
+
+'''
+struct_seq.fasta
+>virus_id1
+A,C,G,...
+>virus_id2
+records = { "virus_id1": "ACG...", "virus_id2": "..." }
+'''
+def load_struct_seq_index(struct_seq_fasta: Optional[Path]) -> Dict[str, str]:
+    if struct_seq_fasta is None or not struct_seq_fasta.exists():
+        print(f"[data] struct_seq_fasta not found: {struct_seq_fasta}")
+        return {}
+
+    records: Dict[str, str] = {}
+    current_id: Optional[str] = None
+    chunks: List[str] = []
+    with open(struct_seq_fasta, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if current_id is not None:
+                    records[current_id] = "".join(chunks).strip()
+                current_id = line[1:].split()[0]
+                chunks = []
+            else:
+                chunks.append(line)
+        if current_id is not None:
+            records[current_id] = "".join(chunks).strip()
+    print(f"[data] loaded struct_seq records={len(records)} from {struct_seq_fasta}")
     return records
 
 
+def find_struct_seq(struct_seq_index: Dict[str, str], name: str) -> Optional[str]:
+    if name in struct_seq_index:
+        return struct_seq_index[name]
+    return None
+
+
+def make_id_aliases(raw_key: str) -> List[str]:
+    key = str(raw_key).strip()
+    if not key:
+        return []
+    path = Path(key)
+    compact_key = compact_identifier(key)
+    compact_name = compact_identifier(path.name)
+    compact_stem = compact_identifier(path.stem)
+    pieces = {
+        key,
+        key.lower(),
+        key.split()[0],
+        key.split("|")[0],
+        key.split("|")[-1],
+        path.name,
+        path.stem,
+        sanitize_filename(key),
+        sanitize_filename(path.name),
+        sanitize_filename(path.stem),
+        sanitize_filename(key).lower(),
+        sanitize_filename(path.name).lower(),
+        sanitize_filename(path.stem).lower(),
+        compact_key,
+        compact_name,
+        compact_stem,
+    }
+    if "/" in key:
+        pieces.add(key.rsplit("/", 1)[-1])
+    return [piece for piece in pieces if piece]
+
+
+def compact_identifier(name: str) -> str:
+    return "".join(ch.lower() for ch in str(name) if ch.isalnum())
+
+
+def load_struct_seq_from_file(path: Optional[Path]) -> Optional[str]:
+    if path is None:
+        return None
+    suffix = path.suffix.lower()
+    if suffix in {".fa", ".fasta", ".txt"}:
+        lines = []
+        with open(path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if line and not line.startswith(">"):
+                    lines.append(line)
+        return "".join(lines).strip() or None
+    if suffix == ".pt":
+        obj = torch.load(path, map_location="cpu")
+        if isinstance(obj, dict):
+            for key in ("struct_seq", "structure_seq", "struct_tokens", "tokens"):
+                if key in obj:
+                    value = obj[key]
+                    if isinstance(value, (list, tuple)):
+                        return ",".join(str(item) for item in value)
+                    return str(value)
+    return None
+
+'''
+structure_dir/...
+ ├─ 1abc.pdb
+ ├─ 2xyz.pt
+ └─ subdir/3def.fa
+↓ build_structure_file_index
+index = {
+    "1abc": Path(...),
+    "1abc.pdb": Path(...),
+    "2xyz": Path(...),
+    "3def": Path(...),
+    ...
+}
+'''
 def build_structure_file_index(
     structure_dir: Optional[Path],
     exts: Tuple[str, ...],
@@ -117,16 +385,14 @@ def build_structure_file_index(
     for path in sorted(paths):
         if not path.is_file() or path.suffix.lower() not in allowed_exts:
             continue
-        index.setdefault(path.stem, path)
-        index.setdefault(sanitize_filename(path.stem), path)
+        key = path.stem
+        index.setdefault(key, path)
     return index
 
 
-def find_structure_file(structure_index: Dict[str, Path], virus_id: str, name: str) -> Optional[Path]:
-    candidates = [virus_id, sanitize_filename(virus_id), name, sanitize_filename(name)]
-    for stem in candidates:
-        if stem in structure_index:
-            return structure_index[stem]
+def find_structure_file(structure_index: Dict[str, Path], name: str) -> Optional[Path]:
+    if name in structure_index:
+        return structure_index[name]
     return None
 
 
@@ -138,22 +404,27 @@ def short_sequence_hash(seq: str) -> str:
     return hashlib.sha1(seq.encode("utf-8")).hexdigest()[:12]
 
 
+# 按照 HA 氨基酸序列 seq 对病毒记录进行分组；如果多个病毒的序列完全相同，就让它们共享同一个结构文件 structure_path 和同一个结构 token 序列 struct_seq；最后返回一个 DataFrame，用来记录“谁共享了谁的结构”。
 def deduplicate_structures_by_sequence(records: Dict[int, VirusRecord]) -> pd.DataFrame:
+    #seq_groups: {"AAAA": [病毒A, 病毒B, 病毒D], "BBBB": [病毒C], "CCCC": [病毒E]}
     seq_groups: Dict[str, List[VirusRecord]] = {}
     for record in records.values():
         seq_groups.setdefault(record.seq, []).append(record)
-
+    
     rows = []
     for seq, group in seq_groups.items():
         group = sorted(group, key=lambda item: item.index)
         structure_records = [record for record in group if record.structure_path is not None]
+        struct_seq_records = [record for record in group if record.struct_seq is not None]
         shared_path = structure_records[0].structure_path if structure_records else None
+        shared_struct_seq = struct_seq_records[0].struct_seq if struct_seq_records else None
         representative_index = structure_records[0].index if structure_records else group[0].index
         representative_id = structure_records[0].virus_id if structure_records else group[0].virus_id
 
         for record in group:
             original_path = record.structure_path
             record.structure_path = shared_path
+            record.struct_seq = shared_struct_seq
             rows.append(
                 {
                     "index": record.index,
@@ -165,13 +436,19 @@ def deduplicate_structures_by_sequence(records: Dict[int, VirusRecord]) -> pd.Da
                     "representative_id": representative_id,
                     "original_structure_path": str(original_path) if original_path is not None else "",
                     "shared_structure_path": str(shared_path) if shared_path is not None else "",
+                    "has_shared_struct_seq": shared_struct_seq is not None,
                     "shared_group_size": len(group),
                 }
             )
     return pd.DataFrame(rows).sort_values(["seq_hash", "index"])
 
 
-def load_hi(hi_path: Path, virus_records: Dict[int, VirusRecord], require_structure: bool) -> pd.DataFrame:
+def load_hi(
+    hi_path: Path,
+    virus_records: Dict[int, VirusRecord],
+    require_structure: bool,
+    require_struct_seq: bool = False,
+) -> pd.DataFrame:
     hi = pd.read_csv(hi_path)
     required = {"at_index", "sr_index", "max_year", "min_year", "distance", "class"}
     missing = required - set(hi.columns)
@@ -182,16 +459,26 @@ def load_hi(hi_path: Path, virus_records: Dict[int, VirusRecord], require_struct
     hi = hi[hi["at_index"].isin(valid_indices) & hi["sr_index"].isin(valid_indices)].copy()
     hi["distance"] = pd.to_numeric(hi["distance"], errors="coerce")
     hi = hi.dropna(subset=["distance"])
+    print(f"[data] HI rows after HA-index filtering={len(hi)}")
 
     if require_structure:
         has_structure = {idx for idx, rec in virus_records.items() if rec.structure_path is not None}
+        before = len(hi)
         hi = hi[hi["at_index"].isin(has_structure) & hi["sr_index"].isin(has_structure)].copy()
+        print(f"[data] HI rows after structure-file filtering={len(hi)} from {before}")
 
-    if hi.empty:
-        raise ValueError("No usable HI rows remain after filtering.")
+    if require_struct_seq:
+        has_struct_seq = {idx for idx, rec in virus_records.items() if rec.struct_seq}
+        before = len(hi)
+        hi = hi[hi["at_index"].isin(has_struct_seq) & hi["sr_index"].isin(has_struct_seq)].copy()
+        print(
+            f"[data] HI rows after struct-seq filtering={len(hi)} from {before}; "
+            f"viruses_with_struct_seq={len(has_struct_seq)}/{len(virus_records)}"
+        )
     return hi
 
 
+# 把 HI 表中的两两病毒抗原距离，整理成“每个病毒对应一组邻居病毒及距离”的字典，并按距离从近到远排序。
 def build_distance_neighbors(hi: pd.DataFrame) -> Dict[int, List[Tuple[int, float]]]:
     neighbors: Dict[int, Dict[int, float]] = {}
     for row in hi.itertuples(index=False):
@@ -200,6 +487,7 @@ def build_distance_neighbors(hi: pd.DataFrame) -> Dict[int, List[Tuple[int, floa
         d = float(row.distance)
         neighbors.setdefault(a, {})
         neighbors.setdefault(b, {})
+        # 重复的抗原-抗血清对取最小值
         neighbors[a][b] = min(d, neighbors[a].get(b, d))
         neighbors[b][a] = min(d, neighbors[b].get(a, d))
 
@@ -209,7 +497,39 @@ def build_distance_neighbors(hi: pd.DataFrame) -> Dict[int, List[Tuple[int, floa
         if len(items) >= 2
     }
 
+def pair_key(a: int, b: int) -> Tuple[int, int]:
+    return tuple(sorted((int(a), int(b))))
 
+
+def build_pair_distance_dict(hi: pd.DataFrame) -> Dict[Tuple[int, int], float]:
+    pair_dist: Dict[Tuple[int, int], float] = {}
+
+    for row in hi.itertuples(index=False):
+        a = int(row.at_index)
+        b = int(row.sr_index)
+        d = float(row.distance)
+
+        if a == b:
+            continue
+
+        key = pair_key(a, b)
+
+        # 如果同一对病毒有多条记录，保守地取最小距离
+        pair_dist[key] = min(d, pair_dist.get(key, d))
+
+    return pair_dist
+
+def is_positive_pair(
+    pair_dist: Dict[Tuple[int, int], float],
+    a: int,
+    b: int,
+    pos_threshold: float = 2.0,
+) -> bool:
+    d = pair_dist.get(pair_key(a, b))
+    return d is not None and d < pos_threshold
+
+
+# 根据 HI 抗原距离，为每个病毒构造三元组：anchor / positive / negative。
 def sample_hi_triplets(
     hi: pd.DataFrame,
     distance_threshold: float,
@@ -218,31 +538,109 @@ def sample_hi_triplets(
     seed: int,
     mode: str,
 ) -> List[TripletRecord]:
+    # 随机数生成器
     rng = np.random.default_rng(seed)
     neighbors = build_distance_neighbors(hi)
+
+    # 新增：构建任意两个病毒之间的距离查询表
+    pair_dist = build_pair_distance_dict(hi)
+
     triplets: List[TripletRecord] = []
+    pos_threshold = 2.0
+    neg_threshold = 2.0
 
     for anchor, candidates in neighbors.items():
-        if len(candidates) < 2:
+
+        # 1. 去掉 anchor 自己
+        candidates = [
+            (idx, dist)
+            for idx, dist in candidates
+            if idx != anchor
+        ]
+
+        # 2. 初始 positive 候选：A-B 距离小于 2
+        raw_close_candidates = [
+            (idx, dist)
+            for idx, dist in candidates
+            if dist < pos_threshold
+        ]
+
+        # 3. 初始 negative 候选：A-D 距离大于 2
+        raw_far_candidates = [
+            (idx, dist)
+            for idx, dist in candidates
+            if dist > neg_threshold
+        ]
+
+        if not raw_close_candidates or not raw_far_candidates:
             continue
 
-        mid = max(1, len(candidates) // 2)
-        close_candidates = candidates[:mid]
-        far_candidates = candidates[mid:]
+        # 4. 新增条件一：
+        # 如果 A-B 和 A-C 都是 positive，那么 B-C 也必须相似
+        close_candidates = []
+        for pos_index, pos_distance in raw_close_candidates:
+            valid_positive = True
+
+            for other_pos_index, _ in raw_close_candidates:
+                if other_pos_index == pos_index:
+                    continue
+
+                # 要求 positive 集合内部两两相似
+                if not is_positive_pair(
+                    pair_dist,
+                    pos_index,
+                    other_pos_index,
+                    pos_threshold=pos_threshold,
+                ):
+                    valid_positive = False
+                    break
+
+            if valid_positive:
+                close_candidates.append((pos_index, pos_distance))
+
+        if not close_candidates:
+            continue
+
+        # 5. 新增条件二：
+        # 如果 A-D 是 negative，那么 D 不能和 A 的任何 positive 相似
+        far_candidates = []
+        for neg_index, neg_distance in raw_far_candidates:
+            valid_negative = True
+
+            for pos_index, _ in close_candidates:
+                # 如果 positive 和 negative 之间也相似，则这个 negative 不可靠
+                if is_positive_pair(
+                    pair_dist,
+                    pos_index,
+                    neg_index,
+                    pos_threshold=pos_threshold,
+                ):
+                    valid_negative = False
+                    break
+
+            if valid_negative:
+                far_candidates.append((neg_index, neg_distance))
+
         if not far_candidates:
-            far_candidates = candidates[1:]
+            continue
 
         if mode == "all":
             for pos_index, pos_distance in close_candidates:
                 for neg_index, neg_distance in far_candidates:
+
+                    # 6. anchor、positive、negative 三者必须不同
+                    if pos_index == anchor or neg_index == anchor:
+                        continue
                     if pos_index == neg_index:
                         continue
 
+                    # 7. negative 和 positive 与 anchor 的距离差必须足够大
                     distance_gap = neg_distance - pos_distance
                     if distance_gap < distance_threshold:
                         continue
 
                     margin = distance_scale * distance_gap / max(distance_threshold, 1e-8)
+
                     triplets.append(
                         TripletRecord(
                             anchor=anchor,
@@ -254,14 +652,25 @@ def sample_hi_triplets(
                             margin=margin,
                         )
                     )
+
             continue
 
         sampled = 0
         attempts = 0
+
         while sampled < samples_per_anchor and attempts < samples_per_anchor * 50:
             attempts += 1
-            pos_index, pos_distance = close_candidates[int(rng.integers(0, len(close_candidates)))]
-            neg_index, neg_distance = far_candidates[int(rng.integers(0, len(far_candidates)))]
+
+            pos_index, pos_distance = close_candidates[
+                int(rng.integers(0, len(close_candidates)))
+            ]
+
+            neg_index, neg_distance = far_candidates[
+                int(rng.integers(0, len(far_candidates)))
+            ]
+
+            if pos_index == anchor or neg_index == anchor:
+                continue
             if pos_index == neg_index:
                 continue
 
@@ -270,6 +679,7 @@ def sample_hi_triplets(
                 continue
 
             margin = distance_scale * distance_gap / max(distance_threshold, 1e-8)
+
             triplets.append(
                 TripletRecord(
                     anchor=anchor,
@@ -281,12 +691,14 @@ def sample_hi_triplets(
                     margin=margin,
                 )
             )
+
             sampled += 1
 
     if not triplets:
         raise ValueError(
             "No HI triplets were sampled. Try lowering --distance-threshold or increasing HI coverage."
         )
+
     return triplets
 
 
@@ -403,6 +815,15 @@ def encode_sequence(seq: str, max_length: int) -> torch.Tensor:
     return torch.tensor(ids, dtype=torch.long)
 
 
+def decode_sequence(seq_ids: torch.Tensor) -> str:
+    return "".join(ID_TO_AA.get(int(idx), "X") for idx in seq_ids if int(idx) != PAD_ID)
+
+
+def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask = mask.to(values.dtype).unsqueeze(-1)
+    return (values * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+
+
 class VirusFeatureStore:
     def __init__(self, records: Dict[int, VirusRecord], max_seq_len: int, structure_dim: int):
         self.records = records
@@ -415,6 +836,8 @@ class VirusFeatureStore:
             "seq_ids": encode_sequence(record.seq, self.max_seq_len),
             "structure": self.structure_loader.load(record.structure_path),
             "index": torch.tensor(record.index, dtype=torch.long),
+            "aa_seq": record.seq,
+            "struct_seq": record.struct_seq or "",
         }
 
 
@@ -463,7 +886,7 @@ class PairDataset(Dataset):
 
 
 def move_feature_batch(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
-    return {key: value.to(device) for key, value in batch.items()}
+    return {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch.items()}
 
 
 class SimpleMultimodalEncoder(nn.Module):
@@ -488,7 +911,14 @@ class SimpleMultimodalEncoder(nn.Module):
             nn.Linear(hidden_dim, output_dim),
         )
 
-    def forward(self, seq_ids: torch.Tensor, structure: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        seq_ids: torch.Tensor,
+        structure: torch.Tensor,
+        aa_seq: Optional[List[str]] = None,
+        struct_seq: Optional[List[str]] = None,
+        index: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         mask = seq_ids.ne(PAD_ID).float().unsqueeze(-1)
         seq_emb = self.embedding(seq_ids)
         pooled = (seq_emb * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
@@ -514,8 +944,17 @@ class DPLM2Backbone(nn.Module):
         class_name: str,
         model_name_or_path: str,
         struct_tokenizer_dir: Optional[str] = None,
+        mismatch_strategy: str = "gap",
+        max_mismatch_ratio: float = 0.1,
+        aa_gap_token: str = "X",
+        struct_missing_token: str = "auto",
     ):
         super().__init__()
+        self.mismatch_strategy = mismatch_strategy
+        self.max_mismatch_ratio = max_mismatch_ratio
+        self.aa_gap_token = aa_gap_token
+        self.struct_missing_token = struct_missing_token
+        self._mismatch_warnings = 0
         module = importlib.import_module(module_name)
         cls = getattr(module, class_name)
         model_name_or_path = str(model_name_or_path)
@@ -528,20 +967,221 @@ class DPLM2Backbone(nn.Module):
         else:
             self.model = cls(model_name_or_path)
 
-    def forward(self, seq_ids: torch.Tensor, structure: torch.Tensor) -> torch.Tensor:
-        output = self.model(seq_ids=seq_ids, structure=structure)
+    def forward(
+        self,
+        seq_ids: Optional[torch.Tensor] = None,
+        structure: Optional[torch.Tensor] = None,
+        aa_seq: Optional[List[str]] = None,
+        struct_seq: Optional[List[str]] = None,
+        index: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if input_ids is None:
+            input_ids = self.build_input_ids(seq_ids=seq_ids, aa_seq=aa_seq, struct_seq=struct_seq)
+        self.validate_input_ids(input_ids)
+
+        output = self.model(input_ids=input_ids)
         if isinstance(output, torch.Tensor):
             return output
         if isinstance(output, dict):
-            for key in ("pooler_output", "last_hidden_state", "embedding", "embeddings"):
+            if "last_hidden_state" in output:
+                return self.pool_multimodal_hidden(output["last_hidden_state"], input_ids)
+            for key in ("pooler_output", "embedding", "embeddings"):
                 if key in output:
-                    value = output[key]
-                    return value.mean(dim=1) if value.dim() == 3 else value
+                    return output[key]
         if hasattr(output, "pooler_output"):
             return output.pooler_output
         if hasattr(output, "last_hidden_state"):
-            return output.last_hidden_state.mean(dim=1)
+            return self.pool_multimodal_hidden(output.last_hidden_state, input_ids)
         raise TypeError("Unsupported dplm-2 output type. Please adapt DPLM2Backbone.forward().")
+
+    def build_input_ids(
+        self,
+        seq_ids: Optional[torch.Tensor],
+        aa_seq: Optional[List[str]],
+        struct_seq: Optional[List[str]],
+    ) -> torch.Tensor:
+        if aa_seq is None:
+            if seq_ids is None:
+                raise ValueError("DPLM2Backbone needs aa_seq or seq_ids.")
+            aa_seq = [decode_sequence(row) for row in seq_ids.detach().cpu()]
+        elif isinstance(aa_seq, str):
+            aa_seq = [aa_seq]
+
+        if struct_seq is None:
+            raise ValueError(
+                "DPLM2Backbone needs struct_seq. Provide --struct-seq-fasta or structure files containing struct_seq."
+            )
+        elif isinstance(struct_seq, str):
+            struct_seq = [struct_seq]
+
+        aa_inputs = []
+        struct_inputs = []
+        tokenizer = self.get_tokenizer()
+        for aa, struct in zip(aa_seq, struct_seq):
+            if not struct:
+                raise ValueError(f"Missing struct_seq for aa sequence with length {len(aa)}.")
+            struct_tokens = struct.split(",") if "," in struct else list(struct)
+            if len(aa) != len(struct_tokens):
+                aa, struct_tokens = self.handle_length_mismatch(aa, struct_tokens, tokenizer)
+            else:
+                aa = self.replace_aa_gaps(aa)
+            struct_joined = "".join(token.strip() for token in struct_tokens)
+            aa_inputs.append(tokenizer.aa_cls_token + aa + tokenizer.aa_eos_token)
+            struct_inputs.append(
+                tokenizer.struct_cls_token
+                + struct_joined
+                + tokenizer.struct_eos_token
+            )
+
+        aa_batch = tokenizer.batch_encode_plus(
+            aa_inputs,
+            add_special_tokens=False,
+            return_tensors="pt",
+            padding=True,
+        )
+        struct_batch = tokenizer.batch_encode_plus(
+            struct_inputs,
+            add_special_tokens=False,
+            return_tensors="pt",
+            padding=True,
+        )
+        device = next(self.model.parameters()).device
+        aa_ids = aa_batch["input_ids"].to(device)
+        struct_ids = struct_batch["input_ids"].to(device)
+        return torch.cat([struct_ids, aa_ids], dim=1)
+
+    def validate_input_ids(self, input_ids: torch.Tensor) -> None:
+        embedding = self.get_input_embedding()
+        if embedding is None:
+            return
+        vocab_size = embedding.num_embeddings
+        min_id = int(input_ids.min().detach().cpu())
+        max_id = int(input_ids.max().detach().cpu())
+        if min_id < 0 or max_id >= vocab_size:
+            bad = input_ids[(input_ids < 0) | (input_ids >= vocab_size)]
+            examples = bad[:20].detach().cpu().tolist()
+            raise ValueError(
+                f"DPLM2 input_ids out of embedding range: min={min_id}, max={max_id}, "
+                f"vocab_size={vocab_size}, bad_examples={examples}. "
+                "This usually means the structure-missing token is not in the model vocabulary. "
+                "Try --struct-missing-token '<pad>' or another valid tokenizer pad token."
+            )
+
+    def get_input_embedding(self) -> Optional[nn.Embedding]:
+        candidates = []
+        model = self.model
+        candidates.append(model)
+        if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
+            candidates.append(model.base_model.model)
+        for obj in candidates:
+            if hasattr(obj, "get_input_embeddings"):
+                emb = obj.get_input_embeddings()
+                if emb is not None:
+                    return emb
+            try:
+                return obj.net.esm.embeddings.word_embeddings
+            except AttributeError:
+                pass
+        return None
+
+    def handle_length_mismatch(self, aa: str, struct_tokens: List[str], tokenizer) -> Tuple[str, List[str]]:
+        aa_len = len(aa)
+        struct_len = len(struct_tokens)
+        mismatch = abs(aa_len - struct_len)
+        mismatch_ratio = mismatch / max(aa_len, struct_len, 1)
+
+        if self.mismatch_strategy == "gap":
+            gap_count = aa.count("-")
+            if struct_len == aa_len - gap_count:
+                missing_token = self.resolve_struct_missing_token(tokenizer)
+                aligned_struct_tokens = []
+                struct_pos = 0
+                for aa_char in aa:
+                    if aa_char == "-":
+                        aligned_struct_tokens.append(missing_token)
+                    else:
+                        aligned_struct_tokens.append(struct_tokens[struct_pos])
+                        struct_pos += 1
+                aa_for_model = self.replace_aa_gaps(aa)
+                if self._mismatch_warnings < 20:
+                    print(
+                        f"[dplm2] gap-aware alignment aa={aa_len}, struct={struct_len}, "
+                        f"aa_gaps={gap_count}; inserted {gap_count} structure-missing tokens "
+                        f"({missing_token})"
+                    )
+                    self._mismatch_warnings += 1
+                return aa_for_model, aligned_struct_tokens
+
+            raise ValueError(
+                f"Length mismatch cannot be explained by '-' gaps: aa={aa_len}, "
+                f"struct={struct_len}, aa_gaps={gap_count}. "
+                "Please check whether the PDB sequence matches the HA sequence."
+            )
+
+        if self.mismatch_strategy == "error" or mismatch_ratio > self.max_mismatch_ratio:
+            raise ValueError(
+                f"Length mismatch between aa_seq and struct_seq: aa={aa_len}, struct={struct_len}. "
+                f"mismatch_ratio={mismatch_ratio:.4f}, strategy={self.mismatch_strategy}"
+            )
+        if self.mismatch_strategy != "trim":
+            raise ValueError(f"Unsupported mismatch strategy: {self.mismatch_strategy}")
+
+        keep_len = min(aa_len, struct_len)
+        if self._mismatch_warnings < 20:
+            print(
+                f"[dplm2] length mismatch aa={aa_len}, struct={struct_len}; "
+                f"trim both to {keep_len}"
+            )
+            self._mismatch_warnings += 1
+        return aa[:keep_len], struct_tokens[:keep_len]
+
+    def replace_aa_gaps(self, aa: str) -> str:
+        return aa.replace("-", self.aa_gap_token)
+
+    def resolve_struct_missing_token(self, tokenizer) -> str:
+        if self.struct_missing_token != "auto":
+            return self.struct_missing_token
+        for attr in (
+            "struct_pad_token",
+            "pad_token",
+            "struct_unk_token",
+            "unk_token",
+            "struct_mask_token",
+            "mask_token",
+        ):
+            token = getattr(tokenizer, attr, None)
+            if token:
+                return token
+        raise ValueError(
+            "Cannot infer a structure-missing token from tokenizer. "
+            "Please set --struct-missing-token explicitly."
+        )
+
+    def get_tokenizer(self):
+        if hasattr(self.model, "tokenizer"):
+            return self.model.tokenizer
+        if hasattr(self.model, "base_model") and hasattr(self.model.base_model, "model"):
+            inner = self.model.base_model.model
+            if hasattr(inner, "tokenizer"):
+                return inner.tokenizer
+        raise AttributeError("Cannot find tokenizer on dplm-2 model.")
+
+    def pool_multimodal_hidden(self, hidden: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        pad_id = getattr(self.model, "pad_id", None)
+        if pad_id is None and hasattr(self.model, "base_model"):
+            pad_id = getattr(self.model.base_model.model, "pad_id", None)
+        if pad_id is None:
+            pad_id = 1
+
+        half = hidden.shape[1] // 2
+        struct_hidden = hidden[:, :half, :]
+        aa_hidden = hidden[:, half:, :]
+        struct_mask = input_ids[:, :half].ne(pad_id)
+        aa_mask = input_ids[:, half:].ne(pad_id)
+        struct_feature = masked_mean(struct_hidden[:, 1:-1, :], struct_mask[:, 1:-1])
+        aa_feature = masked_mean(aa_hidden[:, 1:-1, :], aa_mask[:, 1:-1])
+        return torch.cat([aa_feature, struct_feature], dim=-1)
 
 
 def maybe_apply_lora(model: nn.Module, args: argparse.Namespace) -> nn.Module:
@@ -550,15 +1190,74 @@ def maybe_apply_lora(model: nn.Module, args: argparse.Namespace) -> nn.Module:
     if get_peft_model is None:
         raise ImportError("peft is not installed. Install peft or run without --use-lora.")
 
+    lora_root = model.model if isinstance(model, DPLM2Backbone) else model
+    target_modules = resolve_lora_targets(lora_root, args.lora_targets)
+    print(f"[lora] target_modules={target_modules}")
     config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        target_modules=[item.strip() for item in args.lora_targets.split(",") if item.strip()],
+        target_modules=target_modules,
         bias="none",
         task_type=TaskType.FEATURE_EXTRACTION,
     )
-    return get_peft_model(model, config)
+    lora_model = get_peft_model(lora_root, config)
+    if isinstance(model, DPLM2Backbone):
+        model.model = lora_model
+        return model
+    return lora_model
+
+
+def resolve_lora_targets(model: nn.Module, target_spec: str) -> List[str]:
+    requested = [item.strip() for item in target_spec.split(",") if item.strip()]
+    linear_suffixes = sorted(
+        {
+            name.split(".")[-1]
+            for name, module in model.named_modules()
+            if isinstance(module, nn.Linear) and name
+        }
+    )
+    if not linear_suffixes:
+        raise ValueError("No nn.Linear modules were found for LoRA injection.")
+
+    if requested and requested != ["auto"]:
+        missing = [name for name in requested if name not in linear_suffixes]
+        if not missing:
+            return requested
+        preview = ", ".join(linear_suffixes[:80])
+        raise ValueError(
+            f"LoRA target modules not found: {missing}. "
+            f"Available nn.Linear suffixes include: {preview}"
+        )
+
+    priority_keywords = (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "query",
+        "key",
+        "value",
+        "out_proj",
+        "qkv",
+        "fc1",
+        "fc2",
+        "fc",
+        "wq",
+        "wk",
+        "wv",
+        "wo",
+    )
+    targets = [
+        suffix
+        for suffix in linear_suffixes
+        if any(keyword in suffix.lower() for keyword in priority_keywords)
+    ]
+
+    if not targets:
+        targets = linear_suffixes
+
+    return targets
 
 
 def build_backbone(args: argparse.Namespace) -> nn.Module:
@@ -572,7 +1271,16 @@ def build_backbone(args: argparse.Namespace) -> nn.Module:
 
     if not args.dplm_module or not args.dplm_class or not args.dplm_model:
         raise ValueError("--dplm-module, --dplm-class and --dplm-model are required for --encoder dplm2")
-    return DPLM2Backbone(args.dplm_module, args.dplm_class, args.dplm_model, args.dplm_struct_tokenizer_dir)
+    return DPLM2Backbone(
+        args.dplm_module,
+        args.dplm_class,
+        args.dplm_model,
+        args.dplm_struct_tokenizer_dir,
+        mismatch_strategy=args.length_mismatch_strategy,
+        max_mismatch_ratio=args.max_mismatch_ratio,
+        aa_gap_token=args.aa_gap_token,
+        struct_missing_token=args.struct_missing_token,
+    )
 
 
 def similarity(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -605,7 +1313,7 @@ def margin_triplet_loss(
 
 
 def encode_batch(model: nn.Module, features: Dict[str, torch.Tensor]) -> torch.Tensor:
-    return model(seq_ids=features["seq_ids"], structure=features["structure"])
+    return model(**features)
 
 
 def train_stage1_dpo(
@@ -615,9 +1323,10 @@ def train_stage1_dpo(
     output_dir: Path,
     device: torch.device,
 ) -> nn.Module:
-    policy = maybe_apply_lora(build_backbone(args), args).to(device)
+    policy = build_backbone(args)
     reference = build_backbone(args).to(device)
-    reference.load_state_dict(policy.base_model.model.state_dict() if hasattr(policy, "base_model") else policy.state_dict(), strict=False)
+    reference.load_state_dict(policy.state_dict(), strict=False)
+    policy = maybe_apply_lora(policy, args).to(device)
     reference.eval()
     for param in reference.parameters():
         param.requires_grad = False
@@ -629,7 +1338,7 @@ def train_stage1_dpo(
     policy.train()
     for epoch in range(1, args.stage1_epochs + 1):
         losses = []
-        for batch in loader:
+        for step, batch in enumerate(tqdm(loader), start=1):
             anchor = move_feature_batch(batch["anchor"], device)
             positive = move_feature_batch(batch["positive"], device)
             negative = move_feature_batch(batch["negative"], device)
@@ -647,12 +1356,24 @@ def train_stage1_dpo(
             loss_dpo = dpo_triplet_loss(p_a, p_p, p_n, r_a, r_p, r_n, args.beta)
             loss_triplet = margin_triplet_loss(p_a, p_p, p_n, margin)
             loss = loss_dpo + args.lambda_triplet * loss_triplet
-
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), args.max_grad_norm)
-            optimizer.step()
+            
+            # 关键：loss 除以累积步数，避免梯度被放大
+            loss_for_backward = loss / args.gradient_accumulation_steps
+            loss_for_backward.backward()
+            # 记录原始 loss，不记录除过的 loss
             losses.append(float(loss.detach().cpu()))
+
+
+            if step % args.gradient_accumulation_steps == 0 or step == len(loader):
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), args.max_grad_norm)
+
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            # optimizer.zero_grad(set_to_none=True)
+            # loss.backward()
+            # torch.nn.utils.clip_grad_norm_(policy.parameters(), args.max_grad_norm)
+            # optimizer.step()
+            # losses.append(float(loss.detach().cpu()))
 
         print(f"[stage1] epoch={epoch} loss={np.mean(losses):.6f}")
 
@@ -670,21 +1391,28 @@ class AntigenMapModel(nn.Module):
         super().__init__()
         self.backbone = backbone
         self.projector = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim // 2),
+            nn.LazyLinear(max(embedding_dim // 2, 2)),
             nn.GELU(),
-            nn.LayerNorm(embedding_dim // 2),
-            nn.Linear(embedding_dim // 2, 2),
+            nn.LayerNorm(max(embedding_dim // 2, 2)),
+            nn.Linear(max(embedding_dim // 2, 2), 2),
         )
         if not train_backbone:
             for param in self.backbone.parameters():
                 param.requires_grad = False
 
-    def forward(self, seq_ids: torch.Tensor, structure: torch.Tensor, index: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        seq_ids: torch.Tensor,
+        structure: torch.Tensor,
+        index: Optional[torch.Tensor] = None,
+        aa_seq: Optional[List[str]] = None,
+        struct_seq: Optional[List[str]] = None,
+    ) -> torch.Tensor:
         if seq_ids.dim() == 1:
             seq_ids = seq_ids.unsqueeze(0)
         if structure.dim() == 1:
             structure = structure.unsqueeze(0)
-        embedding = self.backbone(seq_ids=seq_ids, structure=structure)
+        embedding = self.backbone(seq_ids=seq_ids, structure=structure, aa_seq=aa_seq, struct_seq=struct_seq, index=index)
         return self.projector(embedding)
 
 
@@ -721,7 +1449,8 @@ def train_stage2_map(
     for epoch in range(1, args.stage2_epochs + 1):
         losses = []
         model.train()
-        for batch in pair_loader:
+        for step, batch in enumerate(tqdm(pair_loader), start=1):
+        # for batch in pair_loader:
             left = move_feature_batch(batch["left"], device)
             right = move_feature_batch(batch["right"], device)
             target_distance = batch["distance"].to(device)
@@ -750,11 +1479,22 @@ def train_stage2_map(
                 loss_seq = margin_triplet_loss(y_a, y_p, y_n, margin)
 
             loss = loss_hi + args.lambda_seq * loss_seq + args.lambda_reg * loss_reg
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-            optimizer.step()
+            loss_for_backward = loss / args.gradient_accumulation_steps
+            loss_for_backward.backward()
+            # 记录原始 loss，不记录除过的 loss
             losses.append(float(loss.detach().cpu()))
+
+
+            if step % args.gradient_accumulation_steps == 0 or step == len(pair_loader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            # optimizer.zero_grad(set_to_none=True)
+            # loss.backward()
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            # optimizer.step()
+            # losses.append(float(loss.detach().cpu()))
 
         print(f"[stage2] epoch={epoch} loss={np.mean(losses):.6f}")
 
@@ -802,15 +1542,38 @@ def save_triplets(triplets: List[TripletRecord], path: Path) -> None:
     pd.DataFrame([triplet.__dict__ for triplet in triplets]).to_csv(path, index=False)
 
 
+def save_virus_input_mapping(records: Dict[int, VirusRecord], path: Path) -> None:
+    rows = []
+    for record in sorted(records.values(), key=lambda item: item.index):
+        rows.append(
+            {
+                "index": record.index,
+                "id": record.virus_id,
+                "name": record.name,
+                "compact_name": compact_identifier(record.name),
+                "seq_length": len(record.seq),
+                "structure_path": str(record.structure_path) if record.structure_path else "",
+                "has_struct_seq": bool(record.struct_seq),
+                "struct_seq_length": len(record.struct_seq.split(",")) if record.struct_seq and "," in record.struct_seq else len(record.struct_seq or ""),
+            }
+        )
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DPLM-2 HI-distance DPO and antigen-map training pipeline.")
     parser.add_argument("--ha", type=Path, default=DEFAULT_HA_PATH, help="HA csv: index,name,location,id,year,seq")
     parser.add_argument("--hi", type=Path, default=DEFAULT_HI_PATH, help="HI csv: at_index,sr_index,max_year,min_year,distance,class")
     parser.add_argument("--structure-dir", type=Path, default=DEFAULT_STRUCTURE_DIR)
+    parser.add_argument("--struct-seq-fasta", type=Path, default=DEFAULT_STRUCT_SEQ_FASTA)
+    parser.add_argument("--auto-tokenize-structures", dest="auto_tokenize_structures", action="store_true")
+    parser.add_argument("--no-auto-tokenize-structures", dest="auto_tokenize_structures", action="store_false")
+    parser.set_defaults(auto_tokenize_structures=True)
+    parser.add_argument("--pdb-tokenizer-script", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
     parser.add_argument("--require-structure", action="store_true")
-    parser.add_argument("--no-recursive-structure-search", action="store_true")
-    parser.add_argument("--no-dedupe-structure-by-seq", action="store_true")
+    parser.add_argument("--no-recursive-structure-search", action="store_true", default=False)
+    parser.add_argument("--no-dedupe-structure-by-seq", action="store_true", default=False)
 
     parser.add_argument("--encoder", choices=["simple", "dplm2"], default="dplm2")
     parser.add_argument("--dplm-module", default="byprot.models.dplm2")
@@ -821,15 +1584,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--structure-dim", type=int, default=512)
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--embedding-dim", type=int, default=256)
+    parser.add_argument("--length-mismatch-strategy", choices=["gap", "trim", "error"], default="gap")
+    parser.add_argument("--aa-gap-token", default="X")
+    parser.add_argument("--struct-missing-token", default="auto")
+    parser.add_argument("--max-mismatch-ratio", type=float, default=0.1)
 
     lora_group = parser.add_mutually_exclusive_group()
     lora_group.add_argument("--use-lora", dest="use_lora", action="store_true")
     lora_group.add_argument("--no-use-lora", dest="use_lora", action="store_false")
     parser.set_defaults(use_lora=True)
-    parser.add_argument("--lora-r", type=int, default=16)
-    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--lora-r", type=int, default=4)
+    parser.add_argument("--lora-alpha", type=int, default=8)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
-    parser.add_argument("--lora-targets", default="q_proj,k_proj,v_proj,o_proj")
+    parser.add_argument("--lora-targets", default="auto")
 
     parser.add_argument("--distance-threshold", type=float, default=1.0)
     parser.add_argument("--distance-scale", type=float, default=1.0)
@@ -839,9 +1606,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-scale", type=float, default=1.0)
     parser.add_argument("--seq-triplets-per-anchor", type=int, default=2)
 
-    parser.add_argument("--stage1-epochs", type=int, default=3)
-    parser.add_argument("--stage2-epochs", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--stage1-epochs", type=int, default=40)
+    parser.add_argument("--stage2-epochs", type=int, default=40)
+    parser.add_argument("--batch-size", type=int, default=3)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lr-stage2", type=float, default=1e-3)
@@ -855,7 +1622,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-backbone-stage2", action="store_true")
     parser.add_argument("--skip-stage1", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=43)
+    parser.add_argument("--device", default="cuda:3" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
 
@@ -864,21 +1632,34 @@ def main() -> None:
     set_seed(args.seed)
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 确保 DPLM-2 模型可以拿到每条病毒蛋白的结构 token 序列文件 struct_seq.fasta，如果没有就用 PDB 文件自动生成它，并返回这个路径
+    ensure_struct_seq_fasta(args)
+
+    # 把当前训练/运行的所有参数保存成 config.json 文件，JSON 中 Path 会被转成字符串，缩进 2 格方便查看
     with open(output_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2, default=str)
 
+    # 加载 HA 数据，并将其与蛋白质结构文件及结构 token 对齐，返回的virus_records是一个字典，键是HA表中的index，值是VirusRecord对象，保存每条病毒的序列和结构信息
     virus_records = load_ha(
         args.ha,
         args.structure_dir,
+        args.struct_seq_fasta,
+        # 是否递归搜索子目录里的结构文件
         recursive_structure_search=not args.no_recursive_structure_search,
     )
+
+    # 按照 HA 氨基酸序列 seq 对病毒记录进行分组；如果多个病毒的序列完全相同，就让它们共享同一个结构文件 structure_path 和同一个结构 token 序列 struct_seq；最后返回一个 DataFrame，用来记录“谁共享了谁的结构”
     if not args.no_dedupe_structure_by_seq:
         structure_map = deduplicate_structures_by_sequence(virus_records)
         structure_map.to_csv(output_dir / "structure_sequence_dedup_mapping.csv", index=False)
+    save_virus_input_mapping(virus_records, output_dir / "virus_input_mapping.csv")
 
-    hi = load_hi(args.hi, virus_records, args.require_structure)
+    # 得到hi的表格
+    hi = load_hi(args.hi, virus_records, args.require_structure, require_struct_seq=args.encoder == "dplm2")
     feature_store = VirusFeatureStore(virus_records, args.max_seq_len, args.structure_dim)
 
+    # 构造三元组
     hi_triplets = sample_hi_triplets(
         hi=hi,
         distance_threshold=args.distance_threshold,
@@ -889,6 +1670,7 @@ def main() -> None:
     )
     save_triplets(hi_triplets, output_dir / "hi_dpo_triplets.csv")
 
+    # 
     seq_triplets = sample_sequence_triplets(
         virus_records=virus_records,
         anchors=build_distance_neighbors(hi).keys(),
